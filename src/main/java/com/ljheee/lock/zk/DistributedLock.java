@@ -1,5 +1,6 @@
-package com.ljheee.zk.lock;
+package com.ljheee.lock.zk;
 
+import com.ljheee.lock.IDistributedLock;
 import org.apache.zookeeper.*;
 import org.apache.zookeeper.data.Stat;
 
@@ -8,23 +9,22 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 
 /**
- * 懒汉式：基于时间通知
+ * 懒汉式：基于事件通知
  */
-public class DistributedLock {
+public class DistributedLock implements IDistributedLock {
 
     private ZooKeeper zookeeper;
     private CountDownLatch countDownLatch = new CountDownLatch(1);
+    private CountDownLatch countDownLatch2 = new CountDownLatch(1);
 
 
     // 当前会话关联的最后一级znode，关联后，在当前会话过程中，将能够访问该节点以及其子节点，而不能访问该节点的上级节点和旁系节点，该节点可以视作是当前会话的根节点。
-    private String connectString = "192.168.1.200:2181/myTest";
+    private String connectString = "127.0.0.1:2181/myTest";
 
-
-    // 跟节点
-    private static String PARENT_PATH = "dlocks";
+    // 根节点
+    private static String PARENT_PATH = "/dlocks";
 
     public DistributedLock() {
-
         try {
             zookeeper = new ZooKeeper(connectString, 10000, new Watcher() {
                 public void process(WatchedEvent watchedEvent) {
@@ -44,17 +44,18 @@ public class DistributedLock {
     }
 
 
+    @Override
     public String getLock(String itemId) throws KeeperException, InterruptedException {
 
         // 检查 跟节点
         Stat exists = zookeeper.exists(PARENT_PATH, false);
         if (exists == null) {
-            // 创建分布式锁 持久化跟节点
+            // 创建分布式锁 持久化 根节点
             zookeeper.create(PARENT_PATH, "This is distribute lock root path.".getBytes(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
         }
 
         //
-        String id_path = PARENT_PATH + "/" + itemId;// 存放ID 的父节点
+        String id_path = PARENT_PATH + "/" + itemId;// 存放[有序临时]ID 的父节点
         Stat exists1 = zookeeper.exists(id_path, false);
 
         if (exists1 == null) {
@@ -63,14 +64,15 @@ public class DistributedLock {
 
 
         // 创建 唯一标识的子节点
-        String lock_path = id_path + "/lock_";//  want/lock_0000000000 want/lock_0000000001
+        String lock_path = id_path + "/lock_";//  want/lock_0000000001 want/lock_0000000002  序号从1开始
 
-        String current_path = zookeeper.create(id_path, "This is distribute lock".getBytes(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+        String current_path = zookeeper.create(lock_path, "This is distribute lock".getBytes(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+        System.out.println("current_path=" + current_path);
 
+        // 检查兄弟节点
+        List<String> childrens = zookeeper.getChildren(id_path, false);
 
-        List<String> children = zookeeper.getChildren(current_path, false);
-
-        if (children.size() == 1) {
+        if (childrens.size() == 1) {
             // ok 你是第一个来创建EPHEMERAL_SEQUENTIAL的，直接获得锁，序号路径即为current_path
             return current_path;
         }
@@ -80,24 +82,32 @@ public class DistributedLock {
         int pre_id = Integer.parseInt(current_path_id) - 1;//上一个节点序号
 
 
-        String pre_path = id_path + "/lock_" + String.format("%010d", pre_id);//上一个节点路径
+        String pre_path = id_path + "/lock_" + String.format("%010d", pre_id);//上一个节点路径(总共10位，前面补0)
+        System.out.println("pre_path=" + pre_path);
 
         // 监听上一个节点路径（结束事件）
         zookeeper.exists(pre_path, new Watcher() {
             public void process(WatchedEvent watchedEvent) {
 
                 if (watchedEvent.getType() == Event.EventType.NodeDeleted) {
-                    // ok 轮到你了，现在获得锁了
-                    countDownLatch.countDown();
+                    // 上一节点释放，当前进程获得锁
+                    countDownLatch2.countDown();
                 }
             }
         });
 
-        countDownLatch.await();
+        countDownLatch2.await();
         return current_path;
 
     }
 
+    /**
+     * 删除临时节点
+     * @param itemId
+     * @throws KeeperException
+     * @throws InterruptedException
+     */
+    @Override
     public void releaseLock(String itemId) throws KeeperException, InterruptedException {
         zookeeper.delete(itemId, -1);
     }
@@ -114,6 +124,7 @@ public class DistributedLock {
         DistributedLock distributedLock = new DistributedLock();
 
         String lock = distributedLock.getLock("want");
+        System.out.println("I get lock=" + lock);
 
         //deal data
         Thread.sleep(10000);
